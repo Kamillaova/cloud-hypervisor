@@ -57,7 +57,8 @@ pub use self::http::{start_http_fd_thread, start_http_path_thread};
 use crate::Error as VmmError;
 use crate::config::{
     Error as ConfigError, RestoreConfig, RestoredVfioConfig, Result as ConfigResult,
-    VmMemoryZoneUpdateData, take_inherited_fd, validate_inherited_fds,
+    ValidationError, VmMemoryZoneUpdateData, parse_cpu_affinity, take_inherited_fd,
+    validate_cpu_affinity, validate_inherited_fds,
 };
 use crate::device_tree::DeviceTree;
 use crate::external_fds::{ExternalFds, Target};
@@ -66,8 +67,9 @@ use crate::migration::transport::{
 };
 use crate::vm::{Error as VmError, VmState};
 use crate::vm_config::{
-    ConsoleOutput, DeviceConfig, DiskConfig, ExternalFd, FsConfig, GenericVhostUserConfig,
-    NetConfig, PmemConfig, UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
+    ConsoleOutput, CpuAffinity, DeviceConfig, DiskConfig, ExternalFd, FsConfig,
+    GenericVhostUserConfig, NetConfig, PmemConfig, UserDeviceConfig, VdpaConfig, VmConfig,
+    VsockConfig,
 };
 
 /// API errors are sent back from the VMM API server through the ApiResponse.
@@ -345,6 +347,9 @@ pub struct VmReceiveMigrationData {
     /// New output of the virtio console, in the mode of the source VM.
     #[serde(default)]
     pub console: Option<ConsoleOutput>,
+    /// New vCPU affinity, replacing the one of the source VM.
+    #[serde(default)]
+    pub cpus_affinity: Option<Box<[CpuAffinity]>>,
     #[serde(default, flatten)]
     pub(crate) external_fds: ExternalFds,
 }
@@ -386,6 +391,8 @@ pub enum VmReceiveMigrationConfigError {
     /// A new console output is invalid.
     #[error("Invalid console output for receive-migration")]
     InvalidConsoleOutput(#[source] ConfigError),
+    #[error("Invalid vCPU affinity for receive-migration")]
+    InvalidCpusAffinity(#[source] ValidationError),
 }
 
 impl VmReceiveMigrationData {
@@ -394,7 +401,8 @@ impl VmReceiveMigrationData {
         [,external_fds=[net(<id>)@[<fd>,...],vfio(<id>)@[<fd>],iommu@[<fd>]]]\
         [,zone_updates=[<id@host_numa_node>]][,background_fetch_pages=on|off]\
         [,serial_file=<path>|serial_socket=<path>|serial_tcp=<ip>:<port>]\
-        [,console_file=<path>|console_socket=<path>|console_tcp=<ip>:<port>]\"\
+        [,console_file=<path>|console_socket=<path>|console_tcp=<ip>:<port>]\
+        [,cpus_affinity=[<vcpu>@[<host_cpu>,...],...]]\"\
         \n`vfio_fds=<list_of_vfio_ids_with_their_associated_fd>` and \
         `iommufd_fd=<fd>` are deprecated; use `external_fds` instead. \
         Do not combine the two formats.";
@@ -413,6 +421,7 @@ impl VmReceiveMigrationData {
             .add("zone_updates")
             .add("background_fetch_pages")
             .add_all(ConsoleOutput::UPDATE_OPTIONS)
+            .add("cpus_affinity")
             .add("external_fds");
         parser
             .parse(migration)
@@ -489,6 +498,8 @@ impl VmReceiveMigrationData {
             .map_err(VmReceiveMigrationConfigError::InvalidConsoleOutput)?;
         let console = ConsoleOutput::parse_update(&parser, "console")
             .map_err(VmReceiveMigrationConfigError::InvalidConsoleOutput)?;
+        let cpus_affinity = parse_cpu_affinity(&parser, "cpus_affinity")
+            .map_err(VmReceiveMigrationConfigError::ParseError)?;
 
         let data = Self {
             receiver_url,
@@ -499,6 +510,7 @@ impl VmReceiveMigrationData {
             background_fetch_pages,
             serial,
             console,
+            cpus_affinity,
             external_fds,
         };
 
@@ -538,6 +550,11 @@ impl VmReceiveMigrationData {
         }
         if unique_zones.contains("") {
             return Err(VmReceiveMigrationConfigError::MemoryZoneUpdatesEmptyId);
+        }
+
+        if let Some(affinity) = &self.cpus_affinity {
+            validate_cpu_affinity(affinity)
+                .map_err(VmReceiveMigrationConfigError::InvalidCpusAffinity)?;
         }
 
         Ok(())
@@ -2315,6 +2332,53 @@ mod tests {
     }
 
     #[test]
+    fn test_vm_receive_migration_data_cpus_affinity() {
+        // SAFETY: This test input contains no inherited descriptors.
+        let data = unsafe {
+            VmReceiveMigrationData::parse(
+                "receiver_url=unix:/tmp/sock,cpus_affinity=[0@[2,3],1@[4-5]]",
+            )
+        }
+        .unwrap();
+        assert_eq!(
+            data.cpus_affinity.as_deref(),
+            Some(
+                &[
+                    CpuAffinity {
+                        vcpu: 0,
+                        host_cpus: Box::new([2, 3]),
+                    },
+                    CpuAffinity {
+                        vcpu: 1,
+                        host_cpus: Box::new([4, 5]),
+                    },
+                ][..]
+            )
+        );
+
+        // SAFETY: This test input contains no inherited descriptors.
+        let e = unsafe {
+            VmReceiveMigrationData::parse("receiver_url=unix:/tmp/sock,cpus_affinity=[0@[1024]]")
+        }
+        .unwrap_err();
+        assert!(matches!(
+            e,
+            VmReceiveMigrationConfigError::InvalidCpusAffinity(
+                ValidationError::CpuAffinityExceedsMax(1024, 1024)
+            )
+        ));
+
+        let data: VmReceiveMigrationData = serde_json::from_str(
+            r#"{"receiver_url":"unix:/tmp/sock","cpus_affinity":[{"vcpu":0,"host_cpus":[1024]}]}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            data.validate(),
+            Err(VmReceiveMigrationConfigError::InvalidCpusAffinity(_))
+        ));
+    }
+
+    #[test]
     fn test_vm_receive_migration_data_parse() {
         let data =
             // SAFETY: This test input contains no inherited descriptors.
@@ -2330,6 +2394,7 @@ mod tests {
                 background_fetch_pages: true,
                 serial: None,
                 console: None,
+                cpus_affinity: None,
                 external_fds: Default::default(),
             }
         );
@@ -2380,6 +2445,7 @@ mod tests {
                 console: Some(ConsoleOutput::File {
                     file: PathBuf::from("/tmp/c"),
                 }),
+                cpus_affinity: None,
                 external_fds: Default::default(),
             }
         );
