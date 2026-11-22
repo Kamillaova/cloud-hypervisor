@@ -7807,6 +7807,7 @@ mod common_parallel {
         timeout_s: Option<u64>,
         timeout_strategy: Option<TimeoutStrategy>,
         dest_console_update: Option<String>,
+        dest_cpus_affinity: Option<String>,
     }
 
     fn start_live_migration_tcp_with_flags(
@@ -7870,6 +7871,9 @@ mod common_parallel {
         }
         if let Some(console_update) = &options.dest_console_update {
             receive_arg.push_str(&format!(",{console_update}"));
+        }
+        if let Some(cpus_affinity) = &options.dest_cpus_affinity {
+            receive_arg.push_str(&format!(",cpus_affinity={cpus_affinity}"));
         }
 
         // Start the 'receive-migration' command on the destination
@@ -9472,6 +9476,69 @@ mod common_parallel {
     }
 
     #[test]
+    fn test_live_migration_cpus_affinity() {
+        let guest = basic_regular_guest!(JAMMY_IMAGE_NAME).with_cpu(2);
+        let dest_event_path = temp_event_monitor_path(&guest.tmp_dir);
+        let src_api_socket = temp_api_path(&guest.tmp_dir);
+        let dest_api_socket = format!("{src_api_socket}.dest");
+
+        let mut src_child = GuestCommand::new(&guest)
+            .default_cpus_with_affinity()
+            .default_memory()
+            .default_kernel_cmdline()
+            .default_disks()
+            .default_net()
+            .args(["--api-socket", &src_api_socket])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let mut dest_child = GuestCommand::new(&guest)
+            .args(["--api-socket", &dest_api_socket])
+            .args(["--event-monitor", &format!("path={dest_event_path}")])
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let r = panic::catch_unwind(|| {
+            guest.wait_vm_boot().unwrap();
+            assert!(
+                start_live_migration_tcp_with_flags(
+                    &src_api_socket,
+                    &dest_api_socket,
+                    &dest_event_path,
+                    NonZeroU32::new(1).unwrap(),
+                    &SendMigrationOptions {
+                        dest_cpus_affinity: Some("[0@[3],1@[2]]".to_string()),
+                        ..Default::default()
+                    },
+                ),
+                "Unsuccessful command: 'send-migration' or 'receive-migration'."
+            );
+        });
+        if r.is_err() {
+            print_and_panic(
+                src_child,
+                dest_child,
+                None,
+                "Error occurred during live-migration",
+            );
+        }
+        let _ = src_child.kill();
+        let _ = src_child.wait();
+
+        let pid = dest_child.id();
+        let r = panic::catch_unwind(|| {
+            assert_eq!(vcpu_affinity(pid, 0), "3");
+            assert_eq!(vcpu_affinity(pid, 1), "2");
+        });
+
+        let _ = dest_child.kill();
+        let dest_output = dest_child.wait_with_output().unwrap();
+        handle_child_output(r, &dest_output);
+    }
+
+    #[test]
     fn test_live_migration_tcp_integrity_net() {
         _test_live_migration_tcp_integrity::<NetIntegrityStream>();
     }
@@ -10693,6 +10760,16 @@ mod ivshmem {
     }
 
     #[test]
+    fn test_snapshot_restore_new_cpus_affinity() {
+        snapshot_restore_common::_test_snapshot_restore(
+            snapshot_restore_common::SnapshotRestoreTest {
+                use_new_cpus_affinity: true,
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
     fn test_snapshot_restore_with_resume() {
         snapshot_restore_common::_test_snapshot_restore(
             snapshot_restore_common::SnapshotRestoreTest {
@@ -10893,6 +10970,7 @@ mod snapshot_restore_common {
         pub use_prefault: bool,
         pub check_vmgenid: bool,
         pub use_new_console_file: bool,
+        pub use_new_cpus_affinity: bool,
     }
 
     pub(crate) fn _test_snapshot_restore(cfg: SnapshotRestoreTest) {
@@ -10904,6 +10982,7 @@ mod snapshot_restore_common {
             use_prefault,
             check_vmgenid,
             use_new_console_file,
+            use_new_cpus_affinity,
         } = cfg;
         let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(disk_config));
@@ -10957,11 +11036,16 @@ mod snapshot_restore_common {
         } else {
             "tty".to_string()
         };
+        let cpus = if use_new_cpus_affinity {
+            "boot=4,affinity=[0@[0],1@[1],2@[2],3@[3]]"
+        } else {
+            "boot=4"
+        };
 
         let mut child = GuestCommand::new(&guest)
             .args(["--api-socket", &api_socket_source])
             .args(["--event-monitor", format!("path={event_path}").as_str()])
-            .args(["--cpus", "boot=4"])
+            .args(["--cpus", cpus])
             .args(["--memory", mem_params])
             .args(["--balloon", "size=0"])
             .args(["--kernel", kernel_path.to_str().unwrap()])
@@ -11093,6 +11177,9 @@ mod snapshot_restore_common {
         if use_new_console_file {
             restore_params.push_str(&format!(",console_file={}", console_file(2).display()));
         }
+        if use_new_cpus_affinity {
+            restore_params.push_str(",cpus_affinity=[0@[3],1@[2],2@[1],3@[0]]");
+        }
 
         // Restore the VM from the snapshot
         let mut child = GuestCommand::new(&guest)
@@ -11105,6 +11192,7 @@ mod snapshot_restore_common {
             .capture_output()
             .spawn()
             .unwrap();
+        let restored_pid = child.id();
 
         let expected_events = [
             &MetaEvent {
@@ -11187,6 +11275,11 @@ mod snapshot_restore_common {
 
             // Perform same checks to validate VM has been properly restored
             assert_eq!(guest.get_cpu_count().unwrap_or_default(), 4);
+            if use_new_cpus_affinity {
+                for (vcpu, host_cpu) in [(0, "3"), (1, "2"), (2, "1"), (3, "0")] {
+                    assert_eq!(vcpu_affinity(restored_pid, vcpu), host_cpu);
+                }
+            }
             let total_memory = guest.get_total_memory().unwrap_or_default();
             if use_hotplug {
                 assert!(total_memory > 4_800_000, "total_memory is {total_memory}");
