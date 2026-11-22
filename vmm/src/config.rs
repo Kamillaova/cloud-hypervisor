@@ -799,6 +799,36 @@ fn parse_cpuid_override_entry(
     })
 }
 
+pub(crate) fn parse_cpu_affinity(
+    parser: &OptionParser,
+    option: &str,
+) -> result::Result<Option<Box<[CpuAffinity]>>, OptionParserError> {
+    Ok(parser
+        .convert::<TupleList<u32, Vec<usize>>>(option)?
+        .map(|v| {
+            v.0.into_iter()
+                .map(|Tuple(vcpu, host_cpus)| CpuAffinity {
+                    vcpu,
+                    host_cpus: host_cpus.into_boxed_slice(),
+                })
+                .collect()
+        }))
+}
+
+pub(crate) fn validate_cpu_affinity(affinity: &[CpuAffinity]) -> ValidationResult<()> {
+    for affinity in affinity.iter().flat_map(|affinity| &affinity.host_cpus) {
+        let max_affinity = 8 * size_of::<libc::cpu_set_t>();
+
+        if *affinity >= max_affinity {
+            return Err(ValidationError::CpuAffinityExceedsMax(
+                *affinity,
+                max_affinity,
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl CpusConfig {
     pub const SYNTAX: &'static str = "CPU parameters \
         \"boot=<boot_vcpus>,max=<max_vcpus>,\
@@ -861,17 +891,7 @@ impl CpusConfig {
             .convert::<u8>("max_phys_bits")
             .map_err(Error::ParseCpus)?
             .unwrap_or(DEFAULT_MAX_PHYS_BITS);
-        let affinity = parser
-            .convert::<TupleList<u32, Vec<usize>>>("affinity")
-            .map_err(Error::ParseCpus)?
-            .map(|v| {
-                v.0.iter()
-                    .map(|Tuple(e1, e2)| CpuAffinity {
-                        vcpu: *e1,
-                        host_cpus: e2.clone().into_boxed_slice(),
-                    })
-                    .collect()
-            });
+        let affinity = parse_cpu_affinity(&parser, "affinity").map_err(Error::ParseCpus)?;
 
         let profile = parser
             .get("profile")
@@ -3704,16 +3724,7 @@ impl VmConfig {
         }
 
         if let Some(affinity) = &self.cpus.affinity {
-            for affinity in affinity.iter().flat_map(|affinity| &affinity.host_cpus) {
-                let max_affinity = 8 * size_of::<libc::cpu_set_t>();
-
-                if *affinity >= max_affinity {
-                    return Err(ValidationError::CpuAffinityExceedsMax(
-                        *affinity,
-                        max_affinity,
-                    ));
-                }
-            }
+            validate_cpu_affinity(affinity)?;
         }
 
         if self.memory.size == 0 && self.memory.zones.is_none() {
