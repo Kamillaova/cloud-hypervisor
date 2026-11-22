@@ -292,7 +292,11 @@ no CPU in the cpuset, in which case the vCPU does not start either.
 
 A snapshot and a live migration carry the cgroup path like disk images and
 every other path, so restoring or receiving the VM uses the same path, and
-the cgroup must exist there.
+the cgroup must exist there. An FD cannot be carried over: if the VM used
+`cgroup_fd`, pass a new FD to the restore or receive-migration with
+`external_fds=[cpus_cgroup@[<fd>]]`, or through the HTTP API as an
+`external_fds` entry with the `CpusCgroup` target. Otherwise, the vCPU threads
+stay in the cgroup of Cloud Hypervisor.
 
 _Example_
 
