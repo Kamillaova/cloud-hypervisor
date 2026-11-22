@@ -346,6 +346,13 @@ pub(crate) fn resize_command(
     ret
 }
 
+pub(crate) fn vcpu_affinity(pid: u32, vcpu: u32) -> String {
+    let output = exec_host_command_output(&format!(
+        "taskset -pc $(ps -T -p {pid} | grep -w vcpu{vcpu} | xargs | cut -f 2 -d \" \") | cut -f 6 -d \" \""
+    ));
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
 pub(crate) fn resize_zone_command(api_socket: &str, id: &str, desired_size: &str) -> bool {
     let mut cmd = Command::new(clh_command("ch-remote"));
     cmd.args([
