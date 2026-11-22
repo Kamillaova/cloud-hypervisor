@@ -2641,6 +2641,10 @@ impl RequestHandler for Vmm {
                     vm_config.lock().unwrap().update_fds(external_fds)?;
                 }
 
+                if let Some(affinity) = restore_cfg.cpus_affinity.take() {
+                    vm_config.lock().unwrap().cpus.affinity = Some(affinity);
+                }
+
                 update_memory_zones(&restore_cfg.zone_updates, &vm_config).map_err(|e| {
                     error!("VM Restore failed: {e:?}");
                     VmError::ApplyMemoryZoneUpdate(e)

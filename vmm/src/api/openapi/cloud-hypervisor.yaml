@@ -1959,6 +1959,13 @@ components:
           allOf:
             - $ref: "#/components/schemas/SerialConfig"
           description: New output of the virtio console, in the mode of the snapshot.
+        cpus_affinity:
+          type: array
+          description: >
+            New vCPU affinity, replacing the one of the snapshot. An empty list
+            removes it.
+          items:
+            $ref: "#/components/schemas/CpuAffinity"
         external_fds:
           type: array
           description: >

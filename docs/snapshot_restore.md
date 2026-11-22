@@ -113,6 +113,16 @@ one in the same mode:
     --restore source_url=file:///home/foo/snapshot,serial_tcp=127.0.0.1:4444
 ```
 
+Likewise, `cpus_affinity` replaces the vCPU affinity of the snapshot, in the
+syntax of [`affinity`](cpu.md#affinity), for example if its host CPUs are not
+available on the new host. A vCPU that it does not list is not pinned:
+
+```bash
+./cloud-hypervisor \
+    --api-socket /tmp/cloud-hypervisor.sock \
+    --restore source_url=file:///home/foo/snapshot,cpus_affinity=[0@[4],1@[5]]
+```
+
 See [Network Announcements After Resume](live_migration.md#network-announcements-after-resume)
 for the announcement behavior after restore/resume.
 
