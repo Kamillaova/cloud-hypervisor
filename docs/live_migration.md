@@ -335,6 +335,11 @@ following parameters. Unless marked otherwise, they apply to
 - `console_file <path>`, `console_socket <path>`, or `console_tcp <ip>:<port>`
   (`receive-migration`): \
   The same for the `virtio-console` device.
+- `cpus_affinity <list of vcpu@[host_cpu,...]>` (`receive-migration`): \
+  New vCPU affinity on the destination, in the syntax of
+  [`affinity`](cpu.md#affinity), for example if the host CPUs of the source
+  are not available there. It replaces the affinity of the source VM, so a
+  vCPU that it does not list is not pinned.
 
 ## Connection Timeouts
 

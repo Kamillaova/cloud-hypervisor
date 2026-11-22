@@ -1304,6 +1304,9 @@ impl Vmm {
             vm_config
                 .update_fds(mem::take(&mut receive_data_migration.external_fds))
                 .map_err(|e| MigratableError::MigrateReceive(e.into()))?;
+            if let Some(affinity) = receive_data_migration.cpus_affinity.take() {
+                vm_config.cpus.affinity = Some(affinity);
+            }
         }
 
         let mode = vm_migration_config.memory_mode();
