@@ -3175,6 +3175,8 @@ pub struct RestoreConfig {
     pub serial: Option<ConsoleOutput>,
     #[serde(default)]
     pub console: Option<ConsoleOutput>,
+    #[serde(default)]
+    pub cpus_affinity: Option<Box<[CpuAffinity]>>,
     #[serde(default, flatten)]
     pub(crate) external_fds: ExternalFds,
 }
@@ -3187,7 +3189,8 @@ impl RestoreConfig {
         resume=true|false,\
         zone_updates=<list_of_updates>,\
         serial_file=<path>|serial_socket=<path>|serial_tcp=<ip>:<port>,\
-        console_file=<path>|console_socket=<path>|console_tcp=<ip>:<port>\"\n\
+        console_file=<path>|console_socket=<path>|console_tcp=<ip>:<port>,\
+        cpus_affinity=<list_of_vcpus_with_their_associated_cpuset>\"\n\
         \n`source_url` should be a valid URL (e.g file:///foo/bar or tcp://192.168.1.10/foo)\
         \n`prefault` controls eager prefaulting for the copy-based restore path \
         (disabled by default)\
@@ -3205,7 +3208,9 @@ impl RestoreConfig {
         `iommufd_fd=<fd>` are deprecated; use `external_fds` instead.\
         \n`resume` controls whether the VM will be directly resumed after restore\
         \n`zone_updates` can be used to update NUMA memory zones. \
-        Expects a list of elements in the form `id@host_numa_node`";
+        Expects a list of elements in the form `id@host_numa_node`\
+        \n`cpus_affinity` replaces the vCPU affinity of the snapshot, in the syntax of \
+        `--cpus affinity`";
 
     /// # Safety
     /// Live FDs named in the input must be exclusively owned by the caller.
@@ -3223,6 +3228,7 @@ impl RestoreConfig {
             .add("resume")
             .add("zone_updates")
             .add_all(ConsoleOutput::UPDATE_OPTIONS)
+            .add("cpus_affinity")
             .add("external_fds");
         parser.parse(restore).map_err(Error::ParseRestore)?;
 
@@ -3324,6 +3330,8 @@ impl RestoreConfig {
 
         let serial = ConsoleOutput::parse_update(&parser, "serial")?;
         let console = ConsoleOutput::parse_update(&parser, "console")?;
+        let cpus_affinity =
+            parse_cpu_affinity(&parser, "cpus_affinity").map_err(Error::ParseRestore)?;
 
         Ok(RestoreConfig {
             source_url,
@@ -3336,6 +3344,7 @@ impl RestoreConfig {
             zone_updates,
             serial,
             console,
+            cpus_affinity,
             external_fds,
         })
     }
@@ -3364,6 +3373,10 @@ impl RestoreConfig {
         }
         if unique_zones.contains("") {
             return Err(ValidationError::MemoryZoneUpdatesEmptyId);
+        }
+
+        if let Some(affinity) = &self.cpus_affinity {
+            validate_cpu_affinity(affinity)?;
         }
 
         Ok(())
@@ -7093,6 +7106,26 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             unsafe { RestoreConfig::parse("source_url=/path/to/snapshot,console_tcp=localhost:1") },
             Err(Error::ResolveConsoleTcpAddress { .. })
         ));
+        assert_eq!(
+            // SAFETY: This input contains no inherited descriptors.
+            unsafe {
+                RestoreConfig::parse("source_url=/path/to/snapshot,cpus_affinity=[0@[2,3],1@[4-5]]")
+            }?,
+            RestoreConfig {
+                source_url: PathBuf::from("/path/to/snapshot"),
+                cpus_affinity: Some(Box::new([
+                    CpuAffinity {
+                        vcpu: 0,
+                        host_cpus: Box::new([2, 3]),
+                    },
+                    CpuAffinity {
+                        vcpu: 1,
+                        host_cpus: Box::new([4, 5]),
+                    },
+                ])),
+                ..Default::default()
+            }
+        );
         let files: [File; 6] = array::from_fn(|_| test_fd());
         let [fd0, fd1, fd2, fd3, fd4, fd5] = files.map(IntoRawFd::into_raw_fd);
         // SAFETY: The files transferred exclusive ownership to us.
@@ -7497,6 +7530,16 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         assert_eq!(
             invalid_config_zone_updates.validate(&snapshot_vm_config),
             Err(ValidationError::MemoryZoneUpdatesEmptyId)
+        );
+
+        let mut invalid_cpus_affinity = another_valid_config.clone();
+        invalid_cpus_affinity.cpus_affinity = Some(Box::new([CpuAffinity {
+            vcpu: 0,
+            host_cpus: Box::new([1024]),
+        }]));
+        assert_eq!(
+            invalid_cpus_affinity.validate(&snapshot_vm_config),
+            Err(ValidationError::CpuAffinityExceedsMax(1024, 1024))
         );
 
         let invalid_cow_prefault = RestoreConfig {
